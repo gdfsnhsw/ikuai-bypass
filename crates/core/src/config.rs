@@ -1,0 +1,525 @@
+use std::ffi::OsStr;
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+const EMBEDDED_DEFAULT_CONFIG_YAML: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.yml"));
+
+mod duration_compat {
+    use std::fmt;
+    use std::time::Duration;
+
+    use humantime_serde::re::humantime;
+    use serde::de;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(d: &Duration, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        s.serialize_str(&humantime::format_duration(*d).to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+
+        impl<'de> de::Visitor<'de> for V {
+            type Value = Duration;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "duration as string or nanoseconds")
+            }
+
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(Duration::from_nanos(v))
+            }
+
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if v < 0 {
+                    return Err(E::custom("duration nanoseconds must be >= 0"));
+                }
+                Ok(Duration::from_nanos(v as u64))
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                humantime::parse_duration(v).map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&v)
+            }
+        }
+
+        deserializer.deserialize_any(V)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("read config failed: {0}")]
+    ReadFailed(std::io::Error),
+    #[error("write config failed: {0}")]
+    WriteFailed(std::io::Error),
+    #[error("parse yaml failed: {0}")]
+    ParseFailed(#[from] serde_yaml::Error),
+    #[error("security violation: file extension must be .yml or .yaml")]
+    InvalidExtension,
+    #[error("security violation: cannot write to a symbolic link")]
+    SymlinkDenied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomIspItem {
+    #[serde(rename = "tag")]
+    pub tag: String,
+    #[serde(rename = "url")]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamDomainItem {
+    #[serde(rename = "interface")]
+    pub interface: String,
+    #[serde(rename = "src-addr", default)]
+    pub src_addr: String,
+    #[serde(rename = "src-addr-opt-ipgroup", default)]
+    pub src_addr_opt_ipgroup: String,
+    #[serde(rename = "url")]
+    pub url: String,
+    #[serde(rename = "tag", default)]
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpGroupItem {
+    #[serde(rename = "tag")]
+    pub tag: String,
+    #[serde(rename = "url")]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ipv6GroupItem {
+    #[serde(rename = "tag")]
+    pub tag: String,
+    #[serde(rename = "url")]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamIpPortItem {
+    #[serde(rename = "opt-tagname", default)]
+    pub opt_tagname: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    #[serde(rename = "interface", default)]
+    pub interface: String,
+    #[serde(rename = "nexthop", default)]
+    pub nexthop: String,
+    #[serde(rename = "src-addr", default)]
+    pub src_addr: String,
+    #[serde(rename = "src-addr-opt-ipgroup", default)]
+    pub src_addr_opt_ipgroup: String,
+    #[serde(rename = "src-addr-inv", default)]
+    pub src_addr_inv: i64,
+    #[serde(rename = "ip-group", default)]
+    pub ip_group: String,
+    #[serde(rename = "dst-addr-inv", default)]
+    pub dst_addr_inv: i64,
+    #[serde(rename = "prio", default)]
+    pub prio: i64,
+    #[serde(rename = "mode")]
+    pub mode: i64,
+    #[serde(rename = "ifaceband")]
+    pub ifaceband: i64,
+    #[serde(rename = "protocol", default)]
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WebUiConfig {
+    #[serde(rename = "port", default)]
+    pub port: String,
+    #[serde(rename = "user", default)]
+    pub user: String,
+    #[serde(rename = "pass", default)]
+    pub pass: String,
+    #[serde(rename = "enable", default)]
+    pub enable: bool,
+    #[serde(rename = "cdn-prefix", default)]
+    pub cdn_prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MaxNumberOfOneRecordsConfig {
+    #[serde(rename = "Isp", default)]
+    pub isp: i64,
+    #[serde(rename = "Ipv4", default)]
+    pub ipv4: i64,
+    #[serde(rename = "Ipv6", default)]
+    pub ipv6: i64,
+    #[serde(rename = "Domain", default)]
+    pub domain: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ProxyMode {
+    #[serde(rename = "custom")]
+    Custom,
+    #[serde(rename = "system", alias = "disabled")]
+    System,
+    #[serde(
+        rename = "smart",
+        alias = "onlyGithubApi",
+        alias = "only-github-api",
+        alias = "only_github_api"
+    )]
+    #[default]
+    Smart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub mode: ProxyMode,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub pass: String,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProxyMode::Smart,
+            url: String::new(),
+            user: String::new(),
+            pass: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Config {
+    #[serde(rename = "ikuai-url")]
+    pub ikuai_url: String,
+    #[serde(rename = "ikuai-url-ignore-cert", default)]
+    pub ikuai_url_ignore_cert: bool,
+    #[serde(rename = "username")]
+    pub username: String,
+    #[serde(rename = "password")]
+    pub password: String,
+    #[serde(rename = "cron")]
+    pub cron: String,
+
+    #[serde(rename = "AddErrRetryWait", with = "duration_compat", default)]
+    pub add_err_retry_wait: Duration,
+    #[serde(rename = "AddWait", with = "duration_compat", default)]
+    pub add_wait: Duration,
+
+    #[serde(rename = "run-mode", default)]
+    pub run_mode: String,
+    #[serde(rename = "mode", default)]
+    pub module: String,
+
+    #[serde(rename = "github-proxy", default)]
+    pub github_proxy: String,
+
+    /// Global HTTP proxy configuration.
+    /// 全局 HTTP 代理配置。
+    #[serde(rename = "proxy", default)]
+    pub proxy: ProxyConfig,
+
+    #[serde(rename = "custom-isp", default)]
+    pub custom_isp: Vec<CustomIspItem>,
+    #[serde(rename = "stream-domain", default)]
+    pub stream_domain: Vec<StreamDomainItem>,
+    #[serde(rename = "ip-group", default)]
+    pub ip_group: Vec<IpGroupItem>,
+    #[serde(rename = "ipv6-group", default)]
+    pub ipv6_group: Vec<Ipv6GroupItem>,
+    #[serde(rename = "stream-ipport", default)]
+    pub stream_ipport: Vec<StreamIpPortItem>,
+
+    #[serde(rename = "webui", default)]
+    pub webui: WebUiConfig,
+    #[serde(rename = "MaxNumberOfOneRecords", default)]
+    pub max_number_of_one_records: MaxNumberOfOneRecordsConfig,
+}
+
+impl Config {
+    pub fn embedded_default_yaml() -> &'static str {
+        EMBEDDED_DEFAULT_CONFIG_YAML
+    }
+
+    pub fn load_embedded_default() -> Result<Self, ConfigError> {
+        Self::load_from_yaml_str(Self::embedded_default_yaml())
+    }
+
+    pub fn write_embedded_default_to_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let raw = Self::embedded_default_yaml();
+        let cfg = Self::load_from_yaml_str(raw)?;
+        write_config_file(path.as_ref(), raw.as_bytes())?;
+        Ok(cfg)
+    }
+
+    pub fn load_from_yaml_str(raw: &str) -> Result<Self, ConfigError> {
+        let mut cfg: Config = serde_yaml::from_str(raw)?;
+        cfg.apply_defaults();
+        Ok(cfg)
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let raw = fs::read_to_string(path).map_err(ConfigError::ReadFailed)?;
+        Self::load_from_yaml_str(&raw)
+    }
+
+    pub fn apply_defaults(&mut self) {
+        fn normalize_binary_flag(value: i64) -> i64 {
+            if value == 1 { 1 } else { 0 }
+        }
+
+        // WebUI defaults.
+        // WebUI 默认值。
+        if self.webui.port.trim().is_empty() {
+            // Keep consistent with docs and frontend defaults.
+            // 与文档/前端默认值保持一致。
+            self.webui.port = "19001".to_string();
+        } else {
+            self.webui.port = self.webui.port.trim().to_string();
+        }
+
+        if self.webui.cdn_prefix.is_empty() {
+            self.webui.cdn_prefix = "https://cdn.jsdelivr.net/npm".to_string();
+        }
+
+        if self.run_mode.is_empty() {
+            self.run_mode = "cronAft".to_string();
+        }
+        if self.module.is_empty() {
+            self.module = "ispdomain".to_string();
+        }
+
+        if self.max_number_of_one_records.isp == 0 {
+            self.max_number_of_one_records.isp = 5000;
+        }
+        if self.max_number_of_one_records.ipv4 == 0 {
+            self.max_number_of_one_records.ipv4 = 1000;
+        }
+        if self.max_number_of_one_records.ipv6 == 0 {
+            self.max_number_of_one_records.ipv6 = 1000;
+        }
+        if self.max_number_of_one_records.domain == 0 {
+            self.max_number_of_one_records.domain = 5000;
+        }
+
+        for item in &mut self.stream_domain {
+            if item.tag.is_empty() {
+                item.tag = item.interface.to_string();
+            }
+        }
+
+        for item in &mut self.stream_ipport {
+            item.src_addr_inv = normalize_binary_flag(item.src_addr_inv);
+            item.dst_addr_inv = normalize_binary_flag(item.dst_addr_inv);
+        }
+
+        // Proxy defaults & normalization.
+        // 代理默认值与标准化处理。
+        self.proxy.url = self.proxy.url.trim().to_string();
+        self.proxy.user = self.proxy.user.trim().to_string();
+        self.proxy.pass = self.proxy.pass.trim().to_string();
+        if matches!(self.proxy.mode, ProxyMode::Custom) && self.proxy.url.is_empty() {
+            self.proxy.url = "http://127.0.0.1:7890".to_string();
+        }
+        /* 配置文件应该做为唯一的配置来源
+        // Environment variable overrides (for Docker / ipkg deployment).
+        // Only override when the env var is set and non-empty, so that
+        // config-file-only users are not affected.
+        // 环境变量覆盖（用于 Docker / ipkg 部署场景）。
+        // 仅当环境变量已设置且非空时才覆盖，确保纯配置文件用户不受影响。
+        if let Ok(v) = std::env::var("IKUAI_URL") {
+            if !v.trim().is_empty() {
+                self.ikuai_url = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("IKUAI_USERNAME") {
+            if !v.trim().is_empty() {
+                self.username = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("IKUAI_PASSWORD") {
+            if !v.trim().is_empty() {
+                self.password = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("WEBUI_USER") {
+            if !v.trim().is_empty() {
+                self.webui.user = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("WEBUI_PASS") {
+            if !v.trim().is_empty() {
+                self.webui.pass = v.trim().to_string();
+            }
+        }
+        */
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        let data = serde_yaml::to_string(self)?;
+        write_config_file(path.as_ref(), data.as_bytes())
+    }
+
+    pub fn validate_and_save_raw_yaml(
+        raw: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, ConfigError> {
+        let cfg = Self::load_from_yaml_str(raw)?;
+        write_config_file(path.as_ref(), raw.as_bytes())?;
+        Ok(cfg)
+    }
+
+    /// Returns true when the raw YAML explicitly contains a top-level `mode` field.
+    /// 判断原始 YAML 是否显式包含顶层 mode 字段。
+    /// Used by save-raw to avoid overriding the runtime module chosen via CLI args
+    /// (e.g. `-m ipgroup`) when the saved config does not mention `mode` at all.
+    /// 用于 save-raw：当保存的配置完全不包含 mode 字段时，避免覆盖 CLI 启动参数指定的模块。
+    pub fn yaml_has_explicit_mode(raw: &str) -> bool {
+        serde_yaml::from_str::<serde_yaml::Value>(raw)
+            .map(|value| value.get("mode").is_some())
+            .unwrap_or(false)
+    }
+}
+
+fn write_config_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
+    validate_save_path(path)?;
+    ensure_parent_dir(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true).mode(0o600);
+        let mut f = options.open(path).map_err(ConfigError::WriteFailed)?;
+        f.write_all(data).map_err(ConfigError::WriteFailed)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, data).map_err(ConfigError::WriteFailed)?;
+        Ok(())
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(ConfigError::WriteFailed)?;
+    }
+    Ok(())
+}
+
+pub fn validate_save_path(path: &Path) -> Result<(), ConfigError> {
+    let ext = path.extension().and_then(OsStr::to_str).unwrap_or_default();
+    let ext = ext.to_ascii_lowercase();
+    if ext != "yml" && ext != "yaml" {
+        return Err(ConfigError::InvalidExtension);
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(ConfigError::SymlinkDenied);
+            }
+        }
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(ConfigError::ReadFailed(e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_defaults_empty_fields() {
+        let raw = r#"
+username: admin
+password: admin888
+ikuai-url: http://192.168.1.1
+cron: 0 7 * * *
+"#;
+        let cfg = Config::load_from_yaml_str(raw).unwrap();
+        assert_eq!(cfg.run_mode, "cronAft", "empty run-mode should default to cronAft");
+        assert_eq!(cfg.module, "ispdomain", "empty module should default to ispdomain");
+    }
+
+    #[test]
+    fn test_apply_defaults_preserves_set_values() {
+        let raw = r#"
+username: admin
+password: admin888
+ikuai-url: http://192.168.1.1
+cron: 0 7 * * *
+run-mode: once
+mode: ipgroup
+"#;
+        let cfg = Config::load_from_yaml_str(raw).unwrap();
+        assert_eq!(cfg.run_mode, "once", "explicit run-mode should be kept");
+        assert_eq!(cfg.module, "ipgroup", "explicit mode should be kept");
+    }
+
+    #[test]
+    fn test_apply_defaults_old_spdomain_is_rejected() {
+        let raw = r#"
+username: admin
+password: admin888
+ikuai-url: http://192.168.1.1
+cron: 0 7 * * *
+mode: spdomain
+"#;
+        let cfg = Config::load_from_yaml_str(raw).unwrap();
+        assert_eq!(cfg.module, "spdomain", "apply_defaults does NOT fix spdomain");
+        assert!(
+            crate::runner::validate_module(&cfg.module).is_err(),
+            "spdomain should fail validate_module"
+        );
+    }
+
+    #[test]
+    fn test_embedded_default_has_correct_mode() {
+        let cfg = Config::load_embedded_default().unwrap();
+        assert_eq!(cfg.run_mode, "cronAft");
+        assert_eq!(cfg.module, "ispdomain");
+    }
+}

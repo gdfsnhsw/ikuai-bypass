@@ -1,0 +1,39 @@
+---
+title: iKuai Bypass
+type: docs
+weight: 1
+---
+
+爱快路由器专用的分流规则自动同步工具。
+
+[![GitHub release](https://img.shields.io/github/v/release/joyanhui/ikuai-bypass?style=flat-square&logo=github&label=最新版本)](https://github.com/joyanhui/ikuai-bypass/releases)
+[![GitHub stars](https://img.shields.io/github/stars/joyanhui/ikuai-bypass?style=flat-square&logo=github&label=Stars)](https://github.com/joyanhui/ikuai-bypass)
+[![GitHub downloads](https://img.shields.io/github/downloads/joyanhui/ikuai-bypass/total?style=flat-square&logo=github&label=下载总量)](https://github.com/joyanhui/ikuai-bypass/releases)
+
+
+
+## 🚀 入门
+
+- [快速上手](quickstart.md) — 下载、配置、运行定时任务
+- [爱快两种分流模式解析](router-mode.md) — 运营商(ISP)分流+域名分流 / IP分组和端口分流
+- [CLI 参数说明](cli-params.md) — 命令行参数、运行模式、分流模式
+- [FAQ - 常见问题](faq.md) — 故障排查与使用疑问
+
+## 📦 部署方案
+
+- [部署方案总览](deployment.md) — Docker、CLI、ipkg、PVE、Unraid 全场景
+- [OpenWRT 安装为系统服务](openwrt-service-install.md) — 开机自启配置
+- [iKuai v4 应用市场 ipkg 安装](ikuai-v4-ipkg-install-guide.md) — 直接在爱快中安装
+
+## 📖 参考
+
+- [更新日志](updatelog.md) — 版本历史与变更记录
+- [配置详解与升级指南](v4.4.13-update-to-v4.4.10x.md) — 配置文件参数说明与升级
+- [proxy 与 github-proxy 的区别](proxy-vs-github-proxy-guide.md) — 两种代理配置说明
+- [爱快 4.0.210+ 端口分流参数错误](ikuai-firmware-4.0.210-port-streaming-mode-fix.md) — mode 5/6 兼容性
+- [v4.2.x 注意事项](v4.2.x-notes.md) — 旧版兼容性与配置说明
+
+> **版本提示**：爱快 v3.7x 请用 [v4.2.0](https://github.com/joyanhui/ikuai-bypass/releases/tag/v4.2.0)。旧版 Go 归档至 [v4.4.13](https://github.com/joyanhui/ikuai-bypass/releases/tag/v4.4.13)，升级前阅读[说明](v4.4.13-update-to-v4.4.10x.md)。  
+> **DNS 分流**：可搭配 [ADGuard Home 规则](https://github.com/joyanhui/adguardhome-rules) 自建 DNS 分流解析。
+
+> 如果本项目对你有帮助，请点个 Star！有问题或建议欢迎提交 [GitHub Issues](https://github.com/joyanhui/ikuai-bypass/issues)。

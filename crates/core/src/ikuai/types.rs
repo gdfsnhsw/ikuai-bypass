@@ -1,0 +1,244 @@
+use std::time::Duration;
+
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+
+pub const NAME_PREFIX_IKB: &str = "IKB";
+pub const COMMENT_IKUAI_BYPASS: &str = "IKUAI_BYPASS";
+pub const LEGACY_REPO_COMMENT: &str = "joyanhui/ikuai-bypass";
+pub const NEW_COMMENT: &str = "IkuaiBypass";
+pub const CLEAN_MODE_ALL: &str = "cleanAll";
+
+pub fn managed_comment_markers() -> [&'static str; 3] {
+    // Keep matching historical comment markers during clean/update,
+    // while writing the new alnum-only marker for new records.
+    // 清理/更新时兼容历史备注标记，同时新写入只使用纯字母数字的新备注。
+    [NEW_COMMENT, LEGACY_REPO_COMMENT, COMMENT_IKUAI_BYPASS]
+}
+
+pub const FUNC_NAME_ROUTE_OBJECT: &str = "route_object";
+pub const FUNC_NAME_CUSTOM_ISP: &str = "custom_isp";
+pub const FUNC_NAME_STREAM_DOMAIN: &str = "stream_domain";
+pub const FUNC_NAME_STREAM_IPPORT: &str = "stream_ipport";
+
+#[derive(Debug, Clone)]
+pub struct IKuaiClient {
+    base_url: String,
+    client: reqwest::Client,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum IKuaiError {
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("api error: {0}")]
+    Api(String),
+    #[error("invalid response: {0}")]
+    InvalidResponse(String),
+}
+
+#[derive(Debug, Serialize)]
+pub struct CallReq<T> {
+    pub func_name: String,
+    pub action: String,
+    pub param: T,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+pub struct CallResp<T> {
+    pub code: i64,
+    pub message: String,
+    #[serde(default)]
+    pub results: Option<CallRespData<T>>,
+    #[serde(default)]
+    pub rowid: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+pub struct CallRespData<T> {
+    #[serde(default)]
+    pub total: Option<i64>,
+    pub data: T,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CustomIspData {
+    pub ipgroup: String,
+    pub time: String,
+    pub id: i64,
+    pub comment: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StreamDomainData {
+    pub week: String,
+    pub comment: String,
+    #[serde(rename = "tagname")]
+    pub tag_name: String,
+    pub domain: String,
+    #[serde(rename = "src_addr")]
+    pub src_addr: String,
+    pub interface: String,
+    pub time: String,
+    pub id: i64,
+    pub enabled: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IpGroupData {
+    #[serde(rename = "addr_pool")]
+    pub addr_pool: String,
+    pub comment: String,
+    #[serde(rename = "group_name")]
+    pub group_name: String,
+    pub id: i64,
+    pub r#type: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Ipv6GroupData {
+    #[serde(rename = "addr_pool")]
+    pub addr_pool: String,
+    pub comment: String,
+    #[serde(rename = "group_name")]
+    pub group_name: String,
+    pub id: i64,
+    pub r#type: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StreamIpPortData {
+    pub protocol: String,
+    #[serde(rename = "tagname")]
+    pub tag_name: String,
+    #[serde(rename = "src_port")]
+    pub src_port: String,
+    pub id: i64,
+    pub enabled: String,
+    pub week: String,
+    pub comment: String,
+    pub time: String,
+    #[serde(rename = "src_addr_inv")]
+    pub src_addr_inv: i64,
+    #[serde(rename = "dst_addr_inv")]
+    pub dst_addr_inv: i64,
+    pub nexthop: String,
+    #[serde(rename = "iface_band")]
+    pub iface_band: i64,
+    pub interface: String,
+    pub mode: i64,
+    #[serde(rename = "src_addr")]
+    pub src_addr: String,
+    #[serde(rename = "dst_port")]
+    pub dst_port: String,
+    #[serde(rename = "dst_addr")]
+    pub dst_addr: String,
+    pub r#type: i64,
+}
+
+impl IKuaiClient {
+    pub fn new(base_url: String, ignore_cert: bool) -> Result<Self, IKuaiError> {
+        // 避免网络异常时无限期卡住（比如爱快地址不可达）。
+        // Avoid hanging forever when iKuai is unreachable.
+        let mut builder = reqwest::Client::builder()
+            .cookie_store(true)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30));
+        // 允许忽略 HTTPS 证书错误（用于内网自签名证书场景）。
+        // Allow ignoring HTTPS certificate errors (for self-signed certs on intranet).
+        if ignore_cert {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        // iKuai 通常是内网地址，这里强制直连，避免系统/自定义代理干扰。
+        // iKuai is typically a LAN address; force direct connection.
+        let client = builder.no_proxy().build()?;
+        Ok(Self { base_url, client })
+    }
+
+    pub async fn login(&self, username: &str, password: &str) -> Result<(), IKuaiError> {
+        let passwd = crate::ikuai::utils::md5_hex(password);
+        let pass = base64::engine::general_purpose::STANDARD.encode(format!("salt_11{}", password));
+
+        let req = serde_json::json!({
+            "passwd": passwd,
+            "pass": pass,
+            "remember_password": "",
+            "username": username,
+        });
+        let url = format!("{}/Action/login", self.base_url.trim_end_matches('/'));
+        let text = self.post_json_text(&url, &req).await?;
+        let resp: CallResp<serde_json::Value> = parse_call_response(&text)?;
+        if resp.code != 0 {
+            return Err(IKuaiError::Api(resp.message));
+        }
+        Ok(())
+    }
+
+    pub async fn call<TParam: Serialize, TData: for<'de> Deserialize<'de>>(
+        &self,
+        func_name: &str,
+        action: &str,
+        param: &TParam,
+    ) -> Result<CallResp<TData>, IKuaiError> {
+        let url = format!("{}/Action/call", self.base_url.trim_end_matches('/'));
+        let req = CallReq {
+            func_name: func_name.to_string(),
+            action: action.to_string(),
+            param,
+        };
+        let text = self.post_json_text(&url, &req).await?;
+        let resp: CallResp<TData> = parse_call_response(&text)?;
+        if resp.code != 0 {
+            return Err(IKuaiError::Api(resp.message.to_string()));
+        }
+        Ok(resp)
+    }
+
+    async fn post_json_text<T: Serialize>(
+        &self,
+        url: &str,
+        body: &T,
+    ) -> Result<String, IKuaiError> {
+        let resp = self.client.post(url).json(body).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(IKuaiError::Api(format!(
+                "http status {}: {}",
+                status,
+                trim_body(&text)
+            )));
+        }
+        Ok(text)
+    }
+}
+
+fn parse_call_response<T: for<'de> Deserialize<'de>>(
+    text: &str,
+) -> Result<CallResp<T>, IKuaiError> {
+    serde_json::from_str(text).map_err(|e| {
+        IKuaiError::InvalidResponse(format!("decode error: {} body: {}", e, trim_body(text)))
+    })
+}
+
+fn trim_body(text: &str) -> String {
+    let trimmed = text.trim();
+    const LIMIT: usize = 200;
+    if trimmed.len() <= LIMIT {
+        return trimmed.to_string();
+    }
+    let mut end = 0usize;
+    for (i, ch) in trimmed.char_indices() {
+        let next = i + ch.len_utf8();
+        if next > LIMIT {
+            break;
+        }
+        end = next;
+    }
+    let mut out = trimmed[..end].to_string();
+    out.push_str("...");
+    out
+}

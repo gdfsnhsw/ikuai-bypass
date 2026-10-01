@@ -1,0 +1,37 @@
+[
+  {
+    "default": "ispdomain",
+    "attrname": "APP_RUN_MODE",
+    "label": {
+      "en": "Run Module",
+      "zh": "运行模式"
+    },
+    "required": true,
+    "scope": "environment",
+    "type": "string"
+  },
+  {
+    "default": 19001,
+    "min": 1,
+    "max": 65535,
+    "attrname": "APP_PORT_WEB",
+    "label": {
+      "en": "WebUI Manager Port",
+      "zh": "WebUI 管理端口"
+    },
+    "required": true,
+    "scope": "config",
+    "type": "integer"
+  },
+  {
+    "default": "Asia/Shanghai",
+    "attrname": "TZ",
+    "label": {
+      "en": "Timezone",
+      "zh": "时区"
+    },
+    "required": true,
+    "scope": "environment",
+    "type": "string"
+  }
+]

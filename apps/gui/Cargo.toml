@@ -1,0 +1,20 @@
+[package]
+name = "ikb-app"
+version = "4.4.110"
+edition = "2024"
+license = "AGPL-3.0"
+
+[dependencies]
+ikb-core = { path = "../../crates/core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-log = "2"
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[lib]
+name = "ikb_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]

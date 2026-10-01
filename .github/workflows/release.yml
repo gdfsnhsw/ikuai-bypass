@@ -1,0 +1,1846 @@
+name: Release rust
+
+on:
+  push:
+    tags:
+      # Why/为什么: `cargo release`(workspace) 通常会创建多个 crate tag；只监听一个 canonical tag 避免重复发布。
+      # English: `cargo release` may emit multiple crate tags; only the canonical repo tag should publish.
+      - "ikuai-bypass-v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布版本号，例如 v0.1.0 或 v0.1.0-rc1；仅构建不发布时可留空"
+        required: false
+        type: string
+      trigger_mode:
+        description: "触发模式；手动执行保持 manual，内部自动转发会使用 tag"
+        required: false
+        default: manual
+        type: choice
+        options:
+          - manual
+          - tag
+      build_mode:
+        description: "构建范围"
+        required: true
+        default: minimal
+        type: choice
+        options:
+          - minimal
+          - full
+      build_target:
+        description: "构建目标"
+        required: true
+        default: cli+gui
+        type: choice
+        options:
+          - cli+gui
+          - cli
+          - gui
+      publish_release:
+        description: "是否发布 GitHub Release"
+        required: true
+        type: boolean
+        default: true
+      push_docker:
+        description: "是否推送 Docker 镜像"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  # Why/为什么: tag push 与 release-commit trigger 都可能落到同一个 canonical tag；并发组按 ref+build 维度去重。
+  # English: Deduplicate tag-push and release-commit-triggered runs by canonical ref plus build shape.
+  group: release-${{ github.ref_name || github.run_id }}-${{ github.event.inputs.build_mode || 'full' }}-${{ github.event.inputs.build_target || 'cli+gui' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCKER_IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'joyanhui/ikuai-bypass' }}
+
+jobs:
+  resolve-matrix:
+    name: Resolve Release Meta
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      publish_release: ${{ steps.meta.outputs.publish_release }}
+      push_docker: ${{ steps.meta.outputs.push_docker }}
+      docker_latest: ${{ steps.meta.outputs.docker_latest }}
+      docker_creds_available: ${{ steps.meta.outputs.docker_creds_available }}
+      build_mode: ${{ steps.matrix.outputs.build_mode }}
+      build_target: ${{ steps.matrix.outputs.build_target }}
+      cli_matrix: ${{ steps.matrix.outputs.cli_matrix }}
+      cli_nightly_matrix: ${{ steps.matrix.outputs.cli_nightly_matrix }}
+      bsd_matrix: ${{ steps.matrix.outputs.bsd_matrix }}
+      gui_matrix: ${{ steps.matrix.outputs.gui_matrix }}
+      gui_android_matrix: ${{ steps.matrix.outputs.gui_android_matrix }}
+      gui_ios_matrix: ${{ steps.matrix.outputs.gui_ios_matrix }}
+      docker_cli_matrix: ${{ steps.matrix.outputs.docker_cli_matrix }}
+      ipkg_matrix: ${{ steps.matrix.outputs.ipkg_matrix }}
+      docker_platforms: ${{ steps.matrix.outputs.docker_platforms }}
+      has_cli: ${{ steps.matrix.outputs.has_cli }}
+      has_cli_nightly: ${{ steps.matrix.outputs.has_cli_nightly }}
+      has_bsd: ${{ steps.matrix.outputs.has_bsd }}
+      has_gui: ${{ steps.matrix.outputs.has_gui }}
+      has_gui_desktop: ${{ steps.matrix.outputs.has_gui_desktop }}
+      has_gui_android: ${{ steps.matrix.outputs.has_gui_android }}
+      has_gui_ios: ${{ steps.matrix.outputs.has_gui_ios }}
+      has_linux_amd64_cli: ${{ steps.matrix.outputs.has_linux_amd64_cli }}
+      has_ipkg_cli: ${{ steps.matrix.outputs.has_ipkg_cli }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+          INPUT_TRIGGER_MODE: ${{ github.event.inputs.trigger_mode || 'manual' }}
+          INPUT_PUBLISH_RELEASE: ${{ github.event.inputs.publish_release || 'true' }}
+          INPUT_PUSH_DOCKER: ${{ github.event.inputs.push_docker || 'true' }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          source .github/scripts/release-helpers.sh
+
+          canonicalize_tag_name() {
+            local raw="${1:-}"
+            if [[ -z "${raw}" ]]; then
+              printf '%s' ""
+              return
+            fi
+            if [[ "${raw}" =~ ^manual-(release|build)- ]]; then
+              printf '%s' "${raw}"
+              return
+            fi
+            if [[ "${raw}" =~ ^ikuai-bypass-v(.+)$ ]]; then
+              printf '%s' "${raw}"
+              return
+            fi
+            if [[ "${raw}" =~ ^ikb-(core|cli|app)-v(.+)$ ]]; then
+              printf '%s' "ikuai-bypass-v${BASH_REMATCH[2]}"
+              return
+            fi
+            if [[ "${raw}" =~ ^v(.+)$ ]]; then
+              printf '%s' "ikuai-bypass-v${BASH_REMATCH[1]}"
+              return
+            fi
+            printf '%s' "ikuai-bypass-v${raw}"
+          }
+
+          normalize_version_from_tag() {
+            local raw="${1:-}"
+            if [[ -z "${raw}" ]]; then
+              printf '%s' ""
+              return
+            fi
+            if [[ "${raw}" =~ ^ikuai-bypass-v(.+)$ ]]; then
+              printf '%s' "${BASH_REMATCH[1]}"
+              return
+            fi
+            if [[ "${raw}" =~ ^ikb-(core|cli|app)-v(.+)$ ]]; then
+              printf '%s' "${BASH_REMATCH[2]}"
+              return
+            fi
+            if [[ "${raw}" =~ ^v(.+)$ ]]; then
+              printf '%s' "${BASH_REMATCH[1]}"
+              return
+            fi
+            printf '%s' "${raw}"
+          }
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            tag_name="${REF_NAME}"
+            trigger_mode="tag"
+            publish_release="true"
+            push_docker="true"
+          else
+            tag_name="$(canonicalize_tag_name "${INPUT_RELEASE_TAG}")"
+            trigger_mode="${INPUT_TRIGGER_MODE:-manual}"
+            publish_release="${INPUT_PUBLISH_RELEASE}"
+            push_docker="${INPUT_PUSH_DOCKER}"
+
+            if [[ -z "${tag_name}" && ( "${publish_release}" == "true" || "${push_docker}" == "true" ) ]]; then
+              tag_name="manual-release-$(date +%Y%m%d%H%M%S)"
+              echo "::warning::release_tag is empty on workflow_dispatch, auto-generated tag_name=${tag_name}"
+            fi
+
+            if [[ -z "${tag_name}" ]]; then
+              tag_name="manual-build-${GITHUB_RUN_ID}"
+            fi
+          fi
+
+          version="$(normalize_version_from_tag "${tag_name}")"
+
+          prerelease="false"
+          if [[ "${trigger_mode}" == "manual" ]]; then
+            prerelease="true"
+          elif is_prerelease_tag "${tag_name}"; then
+            prerelease="true"
+          fi
+
+          docker_latest="false"
+          if [[ "${prerelease}" != "true" ]]; then
+            docker_latest="true"
+          fi
+
+          docker_creds_available="false"
+          if [[ -n "${DOCKERHUB_USERNAME}" && -n "${DOCKERHUB_TOKEN}" ]]; then
+            docker_creds_available="true"
+          fi
+
+          if [[ "${push_docker}" == "true" && "${docker_creds_available}" != "true" ]]; then
+            echo "Docker credentials are required when push_docker=true" >&2
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tag_name=${tag_name}"
+            echo "prerelease=${prerelease}"
+            echo "publish_release=${publish_release}"
+            echo "push_docker=${push_docker}"
+            echo "docker_latest=${docker_latest}"
+            echo "docker_creds_available=${docker_creds_available}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - id: matrix
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUILD_MODE: ${{ github.event.inputs.build_mode || '' }}
+          INPUT_BUILD_TARGET: ${{ github.event.inputs.build_target || '' }}
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import json
+          import os
+          import pathlib
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          if event_name == "push":
+              # Why/为什么: tag push 视为正式发布，默认跑 full matrix。
+              build_mode = "full"
+              build_target = "cli+gui"
+          else:
+              build_mode = os.environ.get("INPUT_BUILD_MODE") or "minimal"
+              build_target = os.environ.get("INPUT_BUILD_TARGET") or "cli+gui"
+
+          raw = pathlib.Path(".github/build_matrix.jsonc").read_text()
+          lines = []
+          for line in raw.splitlines():
+              lines.append(line.split("//", 1)[0])
+          matrix = json.loads("\n".join(lines))
+
+          cli = [item for item in matrix["cli"] if build_mode in item["mode"]]
+          cli_nightly = [item for item in matrix.get("cli_nightly", []) if build_mode in item["mode"]]
+          bsd = [item for item in matrix.get("bsd", []) if build_mode in item["mode"]]
+          gui = [item for item in matrix["gui"] if build_mode in item["mode"]]
+          gui_android = [item for item in matrix.get("gui_android", []) if build_mode in item["mode"]]
+          gui_ios = [item for item in matrix.get("gui_ios", []) if build_mode in item["mode"]]
+
+          if build_target == "cli":
+              gui = []
+              gui_android = []
+              gui_ios = []
+          elif build_target == "gui":
+              cli = []
+              cli_nightly = []
+              bsd = []
+
+          docker_cli = [item for item in cli if item.get("docker_platform")]
+          ipkg_cli = [item for item in cli if item["label"] in {"linux-amd64", "linux-arm64"}]
+          docker_platforms = ",".join(item["docker_platform"] for item in docker_cli)
+          has_linux_amd64_cli = any(item["label"] == "linux-amd64" for item in cli)
+          has_ipkg_cli = bool(ipkg_cli)
+
+          outputs = {
+              "build_mode": build_mode,
+              "build_target": build_target,
+              "cli_matrix": json.dumps(cli, separators=(",", ":")),
+              "cli_nightly_matrix": json.dumps(cli_nightly, separators=(",", ":")),
+              "bsd_matrix": json.dumps(bsd, separators=(",", ":")),
+              "gui_matrix": json.dumps(gui, separators=(",", ":")),
+              "gui_android_matrix": json.dumps(gui_android, separators=(",", ":")),
+              "gui_ios_matrix": json.dumps(gui_ios, separators=(",", ":")),
+              "docker_cli_matrix": json.dumps(docker_cli, separators=(",", ":")),
+              "ipkg_matrix": json.dumps(ipkg_cli, separators=(",", ":")),
+              "docker_platforms": docker_platforms,
+              "has_cli": str(bool(cli or cli_nightly or bsd)).lower(),
+              "has_cli_nightly": str(bool(cli_nightly)).lower(),
+              "has_bsd": str(bool(bsd)).lower(),
+              "has_gui": str(bool(gui or gui_android or gui_ios)).lower(),
+              "has_gui_desktop": str(bool(gui)).lower(),
+              "has_gui_android": str(bool(gui_android)).lower(),
+              "has_gui_ios": str(bool(gui_ios)).lower(),
+              "has_linux_amd64_cli": str(has_linux_amd64_cli).lower(),
+              "has_ipkg_cli": str(has_ipkg_cli).lower(),
+          }
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              for key, value in outputs.items():
+                  fh.write(f"{key}={value}\n")
+          PY
+
+  verify-cli:
+    name: Verify CLI Source
+    needs:
+      - resolve-matrix
+      - build-frontend
+    if: needs.resolve-matrix.outputs.has_cli == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          cache-on-failure: true
+          shared-key: verify-cli
+
+      - name: Cargo check CLI
+        run: cargo check -p ikb-cli
+
+  build-frontend:
+    name: Build Frontend Dist
+    needs: resolve-matrix
+    if: needs.resolve-matrix.outputs.has_cli == 'true' || needs.resolve-matrix.outputs.has_gui == 'true' || needs.resolve-matrix.outputs.push_docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://bun.sh/install | bash
+          echo "${HOME}/.bun/bin" >> "${GITHUB_PATH}"
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.bun/install/cache
+            frontends/app/node_modules
+          key: frontend-bun-${{ hashFiles('frontends/app/bun.lock', 'frontends/app/package.json') }}
+          restore-keys: |
+            frontend-bun-
+
+      - name: Install frontend dependencies
+        working-directory: frontends/app
+        run: bun install --frozen-lockfile
+
+      - name: Sync WebUI icons
+        shell: bash
+        run: bash apps/gui/scripts/sync-icons.sh web-only
+
+      - name: Build frontend dist
+        working-directory: frontends/app
+        run: bun run build
+
+      - name: Verify frontend dist
+        run: test -f frontends/app/dist/index.html
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+  build-tauri-icons:
+    name: Build Tauri Icons
+    needs: resolve-matrix
+    if: needs.resolve-matrix.outputs.has_gui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cleanup stale cargo-tauri
+        shell: bash
+        run: |
+          rm -f "$HOME/.cargo/bin/cargo-tauri" "$HOME/.cargo/bin/tauri" \
+            "$HOME/.install-action/bin/cargo-tauri" "$HOME/.install-action/bin/tauri" || true
+
+      - name: Install Tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Generate Tauri icons
+        shell: bash
+        run: bash apps/gui/scripts/sync-icons.sh tauri-only
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tauri-icons
+          path: apps/gui/icons
+
+  build-cli:
+    name: CLI ${{ matrix.label }}
+    needs:
+      - resolve-matrix
+      - verify-cli
+      - build-frontend
+    if: needs.resolve-matrix.outputs.has_cli == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve-matrix.outputs.cli_matrix) }}
+    env:
+      CARGO_TARGET_DIR: target-cli-${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> ${{ env.CARGO_TARGET_DIR }}
+          cache-on-failure: true
+          shared-key: cli-${{ matrix.label }}
+
+      - name: Install cross
+        if: runner.os == 'Linux' && matrix.builder == 'cross'
+        run: cargo install cross --locked
+
+      - name: Build CLI with cargo
+        if: matrix.builder == 'cargo'
+        run: cargo build --locked --release --target ${{ matrix.target }} -p ikb-cli
+
+      - name: Build CLI with cross
+        if: matrix.builder == 'cross'
+        run: cross build --locked --release --target ${{ matrix.target }} -p ikb-cli
+
+      - name: Package CLI artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+          mkdir -p release
+          export package_name="$(ikb_cli_zip_name "${TARGET}")"
+          python <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import zipfile
+
+          target = os.environ["TARGET"]
+          package_name = os.environ["package_name"]
+          release_dir = pathlib.Path("release")
+          build_root = pathlib.Path(os.environ["CARGO_TARGET_DIR"])
+          build_dir = build_root / target / "release"
+          src = build_dir / ("ikb-cli.exe" if "windows" in target else "ikb-cli")
+          if not src.exists():
+              raise SystemExit(f"missing binary: {src}")
+
+          stage = release_dir / f"{package_name}.stage"
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir(parents=True)
+
+          dst_name = "ikuai-bypass.exe" if "windows" in target else "ikuai-bypass"
+          shutil.copy2(src, stage / dst_name)
+          shutil.copy2("README.md", stage / "README.md")
+          shutil.copy2("config.yml", stage / "config.yml")
+
+          out = release_dir / package_name
+          if out.exists():
+              out.unlink()
+          with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
+              for path in stage.rglob("*"):
+                  zf.write(path, path.relative_to(stage))
+          shutil.rmtree(stage)
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.label }}
+          path: release/*.zip
+          compression-level: 0
+
+  build-cli-nightly:
+    name: CLI Nightly Experimental
+    needs:
+      - resolve-matrix
+      - verify-cli
+      - build-frontend
+    if: needs.resolve-matrix.outputs.has_cli_nightly == 'true'
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve-matrix.outputs.cli_nightly_matrix) }}
+    env:
+      CARGO_TARGET_DIR: target-cli-nightly-${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install nightly rust-src
+        run: rustup component add rust-src --toolchain nightly
+
+      - name: Add nightly target
+        shell: bash
+        run: |
+          set +e
+          rustup +nightly target add ${{ matrix.target }}
+          target_add_exit="$?"
+          set -e
+          if [ "${target_add_exit}" -ne 0 ]; then
+            # Why/为什么: 低等级 nightly 目标经常没有预编译 std，后续会由 build-std 兜底。
+            # English: Low-tier nightly targets often miss prebuilt std; later build-std covers this.
+            echo "::warning::Nightly target add skipped for ${{ matrix.target }}; continuing with build-std fallback."
+          fi
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Verify cross binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v cross
+          cross --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> ${{ env.CARGO_TARGET_DIR }}
+          cache-on-failure: true
+          shared-key: cli-nightly-${{ matrix.label }}
+
+      - name: Build nightly CLI
+        id: build_nightly_cli
+        env:
+          CARGO_UNSTABLE_BUILD_STD: "1"
+          RUSTUP_TOOLCHAIN: nightly
+        shell: bash
+        run: |
+          set +e
+          cross build --locked -Z build-std=std,panic_abort --release --target ${{ matrix.target }} -p ikb-cli
+          build_exit="$?"
+          set -e
+          echo "build_exit=${build_exit}" >> "${GITHUB_OUTPUT}"
+          if [ "${build_exit}" -ne 0 ]; then
+            echo "::warning::Nightly experimental target failed: ${{ matrix.target }}"
+          fi
+
+      - name: Package nightly CLI artifact
+        if: steps.build_nightly_cli.outputs.build_exit == '0'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+          mkdir -p release
+          export package_name="$(ikb_cli_zip_name "${TARGET}")"
+          python <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import zipfile
+
+          target = os.environ["TARGET"]
+          package_name = os.environ["package_name"]
+          release_dir = pathlib.Path("release")
+          build_root = pathlib.Path(os.environ["CARGO_TARGET_DIR"])
+          build_dir = build_root / target / "release"
+          src = build_dir / "ikb-cli"
+          if not src.exists():
+              raise SystemExit(f"missing binary: {src}")
+
+          stage = release_dir / f"{package_name}.stage"
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir(parents=True)
+          shutil.copy2(src, stage / "ikuai-bypass")
+          shutil.copy2("README.md", stage / "README.md")
+          shutil.copy2("config.yml", stage / "config.yml")
+
+          out = release_dir / package_name
+          if out.exists():
+              out.unlink()
+          with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
+              for path in stage.rglob("*"):
+                  zf.write(path, path.relative_to(stage))
+          shutil.rmtree(stage)
+          PY
+
+      - uses: actions/upload-artifact@v7
+        if: steps.build_nightly_cli.outputs.build_exit == '0'
+        with:
+          name: cli-${{ matrix.label }}
+          path: release/*.zip
+          compression-level: 0
+
+  build-lxc:
+    name: LXC/Alpine Package
+    needs:
+      - resolve-matrix
+      - build-cli
+    if: needs.resolve-matrix.outputs.has_linux_amd64_cli == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: cli-linux-amd64
+          path: release
+
+      - name: Build LXC/Alpine package
+        shell: bash
+        run: |
+          set -euo pipefail
+          zipball="$(find release -maxdepth 1 -type f -name 'ikuai-bypass-cli-linux-x86_64.zip' | head -1)"
+          test -n "${zipball}"
+          rm -rf stage-lxc
+          mkdir -p stage-lxc
+          ZIPBALL="${zipball}" python <<'PY'
+          import os
+          import pathlib
+          import zipfile
+
+          zipball = pathlib.Path(os.environ["ZIPBALL"])
+          stage = pathlib.Path("stage-lxc")
+          with zipfile.ZipFile(zipball) as zf:
+              zf.extractall(stage)
+          PY
+
+          mkdir -p stage-lxc/usr/local/bin stage-lxc/etc/ikuai-bypass stage-lxc/usr/local/share/ikuai-bypass stage-lxc/etc/init.d stage-lxc/etc/runlevels/default
+          mv stage-lxc/ikuai-bypass stage-lxc/usr/local/bin/ikuai-bypass
+          chmod +x stage-lxc/usr/local/bin/ikuai-bypass
+
+          if [ -f stage-lxc/config.yml ]; then
+            mv stage-lxc/config.yml stage-lxc/etc/ikuai-bypass/config.yml
+          fi
+          if [ -f stage-lxc/README.md ]; then
+            mv stage-lxc/README.md stage-lxc/usr/local/share/ikuai-bypass/README.md
+          fi
+
+          cat > stage-lxc/etc/init.d/ikuai-bypass <<'EOF'
+          #!/sbin/openrc-run
+          description="iKuai Bypass"
+
+          command="/usr/local/bin/ikuai-bypass"
+          command_args="-r cron -c /etc/ikuai-bypass/config.yml"
+          command_background="yes"
+          pidfile="/run/ikuai-bypass.pid"
+
+          depend() {
+            need net
+          }
+          EOF
+          chmod +x stage-lxc/etc/init.d/ikuai-bypass
+          ln -sf /etc/init.d/ikuai-bypass stage-lxc/etc/runlevels/default/ikuai-bypass
+
+          tar -czf release/ikuai-bypass-lxc-alpine-musl-x86_64.tar.gz -C stage-lxc .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-lxc-alpine-musl-amd64
+          path: release/*.tar.gz
+
+  build-gui:
+    name: GUI ${{ matrix.label }}
+    needs:
+      - resolve-matrix
+      - build-frontend
+      - build-tauri-icons
+    if: needs.resolve-matrix.outputs.has_gui_desktop == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve-matrix.outputs.gui_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          cache-on-failure: true
+          shared-key: gui-${{ matrix.label }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tauri-icons
+          path: apps/gui/icons
+
+      - name: Ensure bash on Windows
+        if: runner.os == 'Windows'
+        run: |
+          echo "C:\\Program Files\\Git\\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget
+
+      - name: Cleanup stale cargo-tauri
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rm -f "$HOME/.cargo/bin/cargo-tauri" "$HOME/.cargo/bin/tauri" \
+            "$HOME/.install-action/bin/cargo-tauri" "$HOME/.install-action/bin/tauri" || true
+
+      - name: Install Tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Prepare Tauri CI config
+        working-directory: apps/gui
+        shell: bash
+        env:
+          BUNDLE_ACTIVE: ${{ matrix.bundle_active }}
+        run: |
+          IKB_SKIP_BEFORE_BUILD=1 node ./scripts/prepare-tauri-mobile-config.mjs tauri.ci.conf.json
+          python <<'PY'
+          import json
+          import os
+          import pathlib
+
+          path = pathlib.Path('tauri.ci.conf.json')
+          cfg = json.loads(path.read_text())
+          bundle = cfg.setdefault('bundle', {})
+          bundle['active'] = os.environ.get('BUNDLE_ACTIVE', 'true').lower() == 'true'
+          path.write_text(json.dumps(cfg))
+          PY
+
+      - name: Build GUI app
+        working-directory: apps/gui
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BUNDLE_ARGS: ${{ matrix.bundle_args }}
+          BUNDLE_ACTIVE: ${{ matrix.bundle_active }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "::group::GUI Build Attempt ${attempt}/3"
+            if [ "${BUNDLE_ACTIVE}" = "true" ] && [ -n "${BUNDLE_ARGS}" ]; then
+              if cargo tauri build --target "${TARGET}" ${BUNDLE_ARGS} --config tauri.ci.conf.json; then
+                echo "::notice::GUI Build succeeded on attempt ${attempt}"
+                echo "::endgroup::"
+                break
+              fi
+            else
+              if cargo tauri build --target "${TARGET}" --config tauri.ci.conf.json; then
+                echo "::notice::GUI Build succeeded on attempt ${attempt}"
+                echo "::endgroup::"
+                break
+              fi
+            fi
+            echo "::endgroup::"
+            if [ "${attempt}" -lt 3 ]; then
+              echo "::warning::GUI Build attempt ${attempt} failed, retrying in 30s..."
+              sleep 30
+            fi
+          done
+
+      - name: Collect GUI artifacts
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          LABEL: ${{ matrix.label }}
+          PATTERN: ${{ matrix.collect_pattern }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+          mkdir -p release
+          export zip_name="$(ikb_gui_zip_name "${TARGET}")"
+          export dmg_name="$(ikb_gui_native_name "${TARGET}" ".dmg")"
+          python <<'PY'
+          import glob
+          import os
+          import pathlib
+          import shutil
+          import zipfile
+
+          release_dir = pathlib.Path("release")
+          target = os.environ["TARGET"]
+          pattern = os.environ["PATTERN"]
+          zip_name = os.environ["zip_name"]
+          dmg_name = os.environ["dmg_name"]
+
+          patterns = [pattern]
+          if pattern.startswith("target/release/"):
+              patterns.append(f"target/{target}/release/{pattern.removeprefix('target/release/')}")
+
+          if "windows" in target:
+              patterns.extend([
+                  f"target/{target}/release/ikb-app.exe",
+                  f"target/{target}/release/ikuai-bypass.exe",
+                  "target/release/ikb-app.exe",
+                  "target/release/ikuai-bypass.exe",
+              ])
+
+          found = []
+          for item in patterns:
+              found.extend(glob.glob(item, recursive=True))
+          found = list(dict.fromkeys(pathlib.Path(item) for item in found if pathlib.Path(item).is_file()))
+          if not found:
+              raise SystemExit(f"no bundle matched: {patterns}")
+
+          def package_binary(src: pathlib.Path, package_name: str) -> None:
+              stage = release_dir / f"{package_name}.stage"
+              if stage.exists():
+                  shutil.rmtree(stage)
+              stage.mkdir(parents=True)
+              dst_name = "ikuai-bypass.exe" if "windows" in target else "ikuai-bypass"
+              dst = stage / dst_name
+              shutil.copy2(src, dst)
+
+              out = release_dir / package_name
+              if out.exists():
+                  out.unlink()
+              with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
+                  for path in stage.rglob("*"):
+                      zf.write(path, path.relative_to(stage))
+              shutil.rmtree(stage)
+
+          for src in found:
+              suffix = src.suffix.lower()
+              if suffix == ".dmg":
+                  shutil.copy2(src, release_dir / dmg_name)
+                  continue
+
+              package_binary(src, zip_name)
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gui-${{ matrix.label }}
+          path: release/*
+
+  build-gui-android:
+    name: GUI Android ${{ matrix.label }}
+    needs:
+      - resolve-matrix
+      - build-frontend
+      - build-tauri-icons
+    if: needs.resolve-matrix.outputs.has_gui_android == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve-matrix.outputs.gui_android_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tauri-icons
+          path: apps/gui/icons
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK/NDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Cleanup stale cargo-tauri
+        shell: bash
+        run: |
+          rm -f "$HOME/.cargo/bin/cargo-tauri" "$HOME/.cargo/bin/tauri" \
+            "$HOME/.install-action/bin/cargo-tauri" "$HOME/.install-action/bin/tauri" || true
+
+      - name: Install Tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Prepare Tauri Android config
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          IKB_SKIP_BEFORE_BUILD=1 node ./scripts/prepare-tauri-mobile-config.mjs tauri.android.conf.json
+
+      - name: Recreate Android project
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gen/android
+          cargo tauri android init --ci --config tauri.android.conf.json
+
+      - name: Patch Android mobile project assets
+        working-directory: apps/gui
+        run: node ./scripts/patch-mobile-project.mjs
+
+      - name: Verify Android generated version metadata
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          python <<'PY'
+          import pathlib
+          import re
+
+          cargo_toml = pathlib.Path("Cargo.toml").read_text(encoding="utf-8")
+          version_match = re.search(r'^version\s*=\s*"([^"]+)"\s*$', cargo_toml, re.MULTILINE)
+          if version_match is None:
+              raise SystemExit("missing package version in Cargo.toml")
+          version = version_match.group(1)
+          semver_match = re.match(r'^(\d+)\.(\d+)\.(\d+)', version)
+          if semver_match is None:
+              raise SystemExit(f"unsupported semver: {version}")
+          version_code = (
+              int(semver_match.group(1)) * 1_000_000
+              + int(semver_match.group(2)) * 1_000
+              + int(semver_match.group(3))
+          )
+
+          files = [
+              path for path in pathlib.Path("gen/android").rglob("*")
+              if path.is_file() and path.suffix in {".gradle", ".kts", ".properties"}
+          ]
+          matched_version = []
+          matched_code = []
+          for path in files:
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              if version in text:
+                  matched_version.append(path.as_posix())
+              if str(version_code) in text:
+                  matched_code.append(path.as_posix())
+
+          if not matched_version:
+              raise SystemExit(f"android versionName/version metadata not updated to {version}")
+          if not matched_code:
+              raise SystemExit(f"android versionCode metadata not updated to {version_code}")
+
+          print(f"Android version metadata OK: version={version}, versionCode={version_code}")
+          PY
+
+      - name: Build Android APK
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk_opt=()
+          if cargo tauri android build --help | grep -q -- '--apk'; then
+            apk_opt+=(--apk)
+          fi
+          cargo tauri android build --ci --target "${{ matrix.tauri_target }}" --config tauri.android.conf.json "${apk_opt[@]}"
+
+      - name: Package Android artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_PASSWORD: ${{ secrets.ANDROID_SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+          mkdir -p dist
+
+          if [ -z "${ANDROID_SIGNING_KEYSTORE_BASE64:-}" ] || [ -z "${ANDROID_SIGNING_PASSWORD:-}" ]; then
+            echo "Missing Android signing materials. Please set secrets ANDROID_SIGNING_KEYSTORE_BASE64 and ANDROID_SIGNING_PASSWORD." >&2
+            exit 1
+          fi
+
+          unsigned_apk="$(find apps/gui/gen/android/app/build/outputs/apk -type f -name '*universal*release*unsigned.apk' | head -1 || true)"
+          if [ -z "${unsigned_apk}" ]; then
+            unsigned_apk="$(find apps/gui/gen/android/app/build/outputs/apk -type f -name '*release*unsigned.apk' | head -1 || true)"
+          fi
+          test -n "${unsigned_apk}"
+
+          build_tools_dir="$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          zipalign_bin="${build_tools_dir}/zipalign"
+          apksigner_bin="${build_tools_dir}/apksigner"
+          test -x "${zipalign_bin}"
+          test -x "${apksigner_bin}"
+
+          keystore_path="${RUNNER_TEMP}/android-release.keystore"
+          KEYSTORE_PATH="${keystore_path}" python <<'PY'
+          import base64
+          import os
+          import pathlib
+
+          b64 = os.environ.get("ANDROID_SIGNING_KEYSTORE_BASE64", "")
+          b64 = "".join(b64.split())
+          if not b64:
+              raise SystemExit("ANDROID_SIGNING_KEYSTORE_BASE64 is empty")
+          raw = base64.b64decode(b64)
+          path = pathlib.Path(os.environ["KEYSTORE_PATH"])
+          path.write_bytes(raw)
+          PY
+          chmod 600 "${keystore_path}"
+
+          ks_meta="$(KEYSTORE_PATH="${keystore_path}" ANDROID_SIGNING_PASSWORD="${ANDROID_SIGNING_PASSWORD}" python <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          ks = os.environ["KEYSTORE_PATH"]
+          pw = os.environ["ANDROID_SIGNING_PASSWORD"]
+
+          def try_list(storetype: str):
+              proc = subprocess.run(
+                  [
+                      "keytool",
+                      "-list",
+                      "-v",
+                      "-keystore",
+                      ks,
+                      "-storepass",
+                      pw,
+                      "-storetype",
+                      storetype,
+                  ],
+                  capture_output=True,
+                  text=True,
+              )
+              if proc.returncode != 0:
+                  return None
+
+              aliases = []
+              for line in proc.stdout.splitlines():
+                  line = line.strip()
+                  if line.lower().startswith("alias name:"):
+                      aliases.append(line.split(":", 1)[1].strip())
+              # de-duplicate while keeping order
+              uniq = []
+              for a in aliases:
+                  if a and a not in uniq:
+                      uniq.append(a)
+              return uniq
+
+          for st in ("JKS", "PKCS12"):
+              aliases = try_list(st)
+              if aliases is None:
+                  continue
+              if not aliases:
+                  raise SystemExit(f"No key alias found in keystore (storetype={st})")
+              if len(aliases) != 1:
+                  raise SystemExit(
+                      "Keystore must contain exactly one key alias for CI signing; "
+                      + f"found {len(aliases)}: {aliases}"
+                  )
+              print(f"{st}::{aliases[0]}")
+              sys.exit(0)
+
+          raise SystemExit("Failed to open keystore as JKS or PKCS12. Check password and keystore format.")
+          PY
+          )"
+          ks_type="${ks_meta%%::*}"
+          ks_alias="${ks_meta#*::}"
+
+          final_name="$(ikb_gui_native_name "${TARGET}" ".apk")"
+          aligned_apk="dist/${final_name%.apk}-aligned.apk"
+          final_apk="dist/${final_name}"
+          "${zipalign_bin}" -f 4 "${unsigned_apk}" "${aligned_apk}"
+          "${apksigner_bin}" sign \
+            --ks "${keystore_path}" \
+            --ks-type "${ks_type}" \
+            --ks-pass env:ANDROID_SIGNING_PASSWORD \
+            --key-pass env:ANDROID_SIGNING_PASSWORD \
+            --ks-key-alias "${ks_alias}" \
+            --out "${final_apk}" \
+            "${aligned_apk}"
+          "${apksigner_bin}" verify --verbose "${final_apk}"
+          rm -f "${aligned_apk}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gui-android-${{ matrix.label }}
+          path: dist/*
+
+  build-gui-ios:
+    name: GUI iOS ${{ matrix.label }}
+    needs:
+      - resolve-matrix
+      - build-frontend
+      - build-tauri-icons
+    if: needs.resolve-matrix.outputs.has_gui_ios == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve-matrix.outputs.gui_ios_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tauri-icons
+          path: apps/gui/icons
+
+      - name: Use preinstalled Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          cache-on-failure: true
+          shared-key: gui-ios-${{ matrix.label }}
+
+      - name: Cleanup stale cargo-tauri
+        shell: bash
+        run: |
+          rm -f "$HOME/.cargo/bin/cargo-tauri" "$HOME/.cargo/bin/tauri" \
+            "$HOME/.install-action/bin/cargo-tauri" "$HOME/.install-action/bin/tauri" || true
+
+      - name: Install Tauri CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
+
+      - name: Prepare iOS native dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY
+          unset HOMEBREW_NO_AUTO_UPDATE HOMEBREW_NO_INSTALL_FROM_API
+
+          brew_bin=""
+          if [ -x /opt/homebrew/bin/brew ]; then
+            brew_bin="/opt/homebrew/bin/brew"
+          elif [ -x /usr/local/bin/brew ]; then
+            brew_bin="/usr/local/bin/brew"
+          else
+            brew_bin="$(command -v brew)"
+          fi
+          test -n "${brew_bin}"
+
+          brew_install=("${brew_bin}" install)
+          if [ "$(uname -m)" = "arm64" ]; then
+            brew_install=(arch -arm64 "${brew_bin}" install)
+          fi
+
+          for formula in xcodegen libimobiledevice; do
+            if ! "${brew_bin}" list --versions "${formula}" >/dev/null 2>&1; then
+              "${brew_install[@]}" "${formula}"
+            fi
+          done
+
+          ruby_user_bin="$(ruby -e 'require "rubygems"; print Gem.user_dir')/bin"
+          echo "${ruby_user_bin}" >> "${GITHUB_PATH}"
+          echo "$(dirname "${brew_bin}")" >> "${GITHUB_PATH}"
+
+          if ! command -v pod >/dev/null 2>&1; then
+            gem install --user-install cocoapods --no-document
+          fi
+
+          export PATH="${ruby_user_bin}:$(dirname "${brew_bin}"):${PATH}"
+          xcodegen --version
+          idevice_id --version
+          pod --version
+
+      - name: Prepare Tauri iOS config
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          IKB_SKIP_BEFORE_BUILD=1 node ./scripts/prepare-tauri-mobile-config.mjs tauri.ios.conf.json
+          python <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path('tauri.ios.conf.json')
+          cfg = json.loads(path.read_text())
+          bundle = cfg.setdefault('bundle', {})
+          bundle_ios = bundle.setdefault('iOS', {})
+          bundle_ios['developmentTeam'] = '0000000000'
+          path.write_text(json.dumps(cfg))
+          PY
+
+      - name: Recreate iOS project
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf gen/apple
+          cargo tauri ios init --ci --config tauri.ios.conf.json
+
+      - name: Patch iOS mobile project assets
+        working-directory: apps/gui
+        run: node ./scripts/patch-mobile-project.mjs
+
+      - name: Build iOS artifact
+        working-directory: apps/gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_dev_dir="$(xcode-select -p)"
+          default_toolchain="${xcode_dev_dir}/Toolchains/XcodeDefault.xctoolchain"
+          ci_xcconfig="/tmp/ikb-ios-ci.xcconfig"
+          swift_lib_paths="${default_toolchain}/usr/lib/swift/iphoneos ${default_toolchain}/usr/lib/swift-5.0/iphoneos"
+          swift_ldflags="-L${default_toolchain}/usr/lib/swift/iphoneos -L${default_toolchain}/usr/lib/swift-5.0/iphoneos"
+          cat > "${ci_xcconfig}" <<'XCCONFIG'
+          TOOLCHAINS = com.apple.dt.toolchain.XcodeDefault
+          XCCONFIG
+
+          project_pbxproj="$(find gen/apple -type f -path '*.xcodeproj/project.pbxproj' | head -1 || true)"
+          if [ -n "${project_pbxproj}" ] && [ -f "${project_pbxproj}" ]; then
+            escaped_toolchain="$(printf '%s\n' "${default_toolchain}" | sed 's/[\\/&]/\\&/g')"
+            perl -0777 -i -pe 's/DEVELOPMENT_TEAM = [^;]*;/DEVELOPMENT_TEAM = "";/g; s/CODE_SIGN_STYLE = [^;]*;/CODE_SIGN_STYLE = Manual;/g; s/CODE_SIGN_IDENTITY = [^;]*;/CODE_SIGN_IDENTITY = "";/g; s/CODE_SIGNING_ALLOWED = [^;]*;/CODE_SIGNING_ALLOWED = NO;/g; s/CODE_SIGNING_REQUIRED = [^;]*;/CODE_SIGNING_REQUIRED = NO;/g; s/PROVISIONING_PROFILE_SPECIFIER = [^;]*;/PROVISIONING_PROFILE_SPECIFIER = "";/g; s/PROVISIONING_PROFILE = [^;]*;/PROVISIONING_PROFILE = "";/g;' "${project_pbxproj}"
+            perl -0777 -i -pe "s/\\$\\(TOOLCHAIN_DIR\\)\\/usr\\/lib\\/swift\\//${escaped_toolchain}\\/usr\\/lib\\/swift\\//g; s/\\$\\(TOOLCHAIN_DIR\\)\\/usr\\/lib\\/swift-5\\.0\\//${escaped_toolchain}\\/usr\\/lib\\/swift-5.0\\//g;" "${project_pbxproj}"
+          fi
+
+          has_no_sign="false"
+          if cargo tauri ios build --help | grep -q -- '--no-sign'; then
+            has_no_sign="true"
+          fi
+
+          build_exit=1
+          for attempt in 1 2 3; do
+            echo "::group::iOS Build Attempt ${attempt}/3"
+            set +e
+            if [ "${has_no_sign}" = "true" ]; then
+              APPLE_CERTIFICATE="" \
+              APPLE_CERTIFICATE_PASSWORD="" \
+              APPLE_SIGNING_IDENTITY="" \
+              APPLE_TEAM_ID="" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER="" \
+              PROVISIONING_PROFILE="" \
+              XCODE_XCCONFIG_FILE="${ci_xcconfig}" \
+              LIBRARY_SEARCH_PATHS="${swift_lib_paths}" \
+              OTHER_LDFLAGS="${swift_ldflags}" \
+              TOOLCHAINS="com.apple.dt.toolchain.XcodeDefault" \
+              TOOLCHAIN_DIR="${default_toolchain}" \
+              cargo tauri ios build --ci --target "${{ matrix.tauri_target }}" --config tauri.ios.conf.json --no-sign 2>&1 | tee /tmp/xcodebuild-ios.log
+            else
+              APPLE_CERTIFICATE="" \
+              APPLE_CERTIFICATE_PASSWORD="" \
+              APPLE_SIGNING_IDENTITY="" \
+              APPLE_TEAM_ID="" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              DEVELOPMENT_TEAM="" \
+              PROVISIONING_PROFILE_SPECIFIER="" \
+              PROVISIONING_PROFILE="" \
+              XCODE_XCCONFIG_FILE="${ci_xcconfig}" \
+              LIBRARY_SEARCH_PATHS="${swift_lib_paths}" \
+              OTHER_LDFLAGS="${swift_ldflags}" \
+              TOOLCHAINS="com.apple.dt.toolchain.XcodeDefault" \
+              TOOLCHAIN_DIR="${default_toolchain}" \
+              cargo tauri ios build --ci --target "${{ matrix.tauri_target }}" --config tauri.ios.conf.json 2>&1 | tee /tmp/xcodebuild-ios.log
+            fi
+            build_exit="${PIPESTATUS[0]}"
+            set -e
+            echo "::endgroup::"
+
+            if [ "${build_exit}" -eq 0 ]; then
+              echo "::notice::iOS Build succeeded on attempt ${attempt}"
+              break
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "::warning::iOS Build attempt ${attempt} failed (exit ${build_exit}), retrying in 15s..."
+              sleep 15
+            fi
+          done
+
+          if [ "${build_exit}" -ne 0 ]; then
+            if grep -Eq 'exportArchive No Team Found in Archive|failed to export iOS app|EXPORT FAILED' /tmp/xcodebuild-ios.log; then
+              echo "::warning::Ignoring export failure for unsigned build; fallback to .app packaging."
+            else
+              exit "${build_exit}"
+            fi
+          fi
+
+      - name: Package iOS artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+          mkdir -p dist
+          final_name="$(ikb_gui_native_name "${TARGET}" ".ipa")"
+          ipa="$(find apps/gui -type f -name '*.ipa' | head -1 || true)"
+          if [ -n "${ipa}" ] && [ -f "${ipa}" ]; then
+            cp "${ipa}" "dist/${final_name}"
+            exit 0
+          fi
+
+          app="$(find apps/gui -type d -name '*.app' | head -1 || true)"
+          test -n "${app}"
+          rm -rf /tmp/ios-payload
+          mkdir -p /tmp/ios-payload/Payload
+          cp -R "${app}" /tmp/ios-payload/Payload/
+          (cd /tmp/ios-payload && zip -r -q unsigned.ipa Payload)
+          cp /tmp/ios-payload/unsigned.ipa "dist/${final_name}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gui-ios-${{ matrix.label }}
+          path: dist/*
+
+      - name: Upload iOS build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-build-logs-${{ matrix.label }}
+          path: |
+            /tmp/xcodebuild-ios.log
+            apps/gui/gen/apple/build/**/Logs/**
+          if-no-files-found: ignore
+
+  build-bsd:
+    name: CLI ${{ matrix.label }}
+    needs:
+      - resolve-matrix
+      - verify-cli
+      - build-frontend
+    if: needs.resolve-matrix.outputs.has_bsd == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.resolve-matrix.outputs.bsd_matrix) }}
+    env:
+      CARGO_TARGET_DIR: target-bsd-${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontends/app/dist
+
+      - name: Build in FreeBSD VM
+        if: matrix.vm_os == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          run: |
+            set -euo pipefail
+            env ASSUME_ALWAYS_YES=yes pkg bootstrap -f
+            pkg update -f
+            pkg install -y bash curl gcc gmake pkgconf perl5
+            export PATH="/usr/local/bin:${PATH}"
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+            rustup target add "${{ matrix.target }}"
+            export CARGO_TARGET_DIR="${{ env.CARGO_TARGET_DIR }}"
+            cargo build --locked --release --target "${{ matrix.target }}" -p ikb-cli
+
+      - name: Package BSD artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+          mkdir -p release
+          export package_name="$(ikb_cli_zip_name "${TARGET}")"
+          python <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import zipfile
+
+          target = os.environ["TARGET"]
+          package_name = os.environ["package_name"]
+          release_dir = pathlib.Path("release")
+          build_root = pathlib.Path(os.environ["CARGO_TARGET_DIR"])
+          build_dir = build_root / target / "release"
+          src = build_dir / "ikb-cli"
+          if not src.exists():
+              raise SystemExit(f"missing binary: {src}")
+
+          stage = release_dir / f"{package_name}.stage"
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir(parents=True)
+          shutil.copy2(src, stage / "ikuai-bypass")
+          shutil.copy2("README.md", stage / "README.md")
+          shutil.copy2("config.yml", stage / "config.yml")
+
+          out = release_dir / package_name
+          if out.exists():
+              out.unlink()
+          with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as zf:
+              for path in stage.rglob("*"):
+                  zf.write(path, path.relative_to(stage))
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.label }}
+          path: release/*
+
+  build-ipkg:
+    name: iKuai v4 ipkg
+    needs:
+      - resolve-matrix
+      - build-cli
+    if: needs.resolve-matrix.outputs.has_ipkg_cli == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cli-linux-*
+          merge-multiple: true
+          path: release
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build ipkg
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-matrix.outputs.version }}
+          IPKG_CLI_JSON: ${{ needs.resolve-matrix.outputs.ipkg_matrix }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+
+          normalize_ipkg_version() {
+            local raw="${1:-}"
+            if [[ "${raw}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)([-+].*)?$ ]]; then
+              printf '%s' "${BASH_REMATCH[1]}"
+              return
+            fi
+            printf '%s' "${raw}"
+          }
+
+          read_cli_semver() {
+            local raw
+            raw="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' apps/cli/Cargo.toml | head -1)"
+            normalize_ipkg_version "${raw}"
+          }
+
+          # 1. 先统一准备 manifest 版本号，再按目标架构逐个构建 ipkg。
+          # 1. Resolve the manifest version once, then build each target ipkg sequentially.
+          ipkg_version="$(normalize_ipkg_version "${VERSION}")"
+          if [[ ! "${ipkg_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ipkg_version="$(read_cli_semver)"
+          fi
+          if [[ ! "${ipkg_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid ipkg version: ${ipkg_version}" >&2
+            exit 1
+          fi
+
+          ipkg_dir="packaging/ikuai-ipkg"
+          manifest_template="${ipkg_dir}/ikuai-bypass/manifest.template.json"
+          render_manifest_script="${ipkg_dir}/render-manifest.sh"
+
+          # Why/为什么: iKuai 应用市场最终是一包一镜像，amd64 和 arm64 需要分别导出，避免把错误架构的 ELF 塞进宿主镜像元数据。
+          # English: iKuai installs one image per package, so amd64 and arm64 must be exported separately to keep image metadata aligned with the embedded ELF.
+          jq -c '.[]' <<<"${IPKG_CLI_JSON}" | while IFS= read -r item; do
+            target="$(jq -r '.target' <<<"${item}")"
+            label="$(jq -r '.label' <<<"${item}")"
+            docker_platform="$(jq -r '.docker_platform' <<<"${item}")"
+            zipball_name="$(ikb_cli_zip_name "${target}")"
+            ipkg_name="$(ikb_ipkg_name "${target}")"
+            image_tag="ikuai-bypass:ikuai"
+            stage=".ipkg-stage-${label}"
+            package_stage="${stage}/package/ikuai-bypass"
+
+            bash apps/gui/scripts/sync-icons.sh ipkg-only
+            rm -rf "${stage}"
+            mkdir -p "${stage}/docker/bin/${label}" "${package_stage}"
+            cp -R "${ipkg_dir}/ikuai-bypass/." "${package_stage}/"
+            rm -f "${package_stage}/manifest.template.json" "${package_stage}/docker_image.tar.gz"
+
+            zipball="$(find release -maxdepth 1 -type f -name "${zipball_name}" | head -1)"
+            test -n "${zipball}"
+            unzip -q "${zipball}" -d "${stage}/unpack"
+            cp "${stage}/unpack/ikuai-bypass" "${stage}/docker/bin/${label}/ikuai-bypass"
+            chmod +x "${stage}/docker/bin/${label}/ikuai-bypass"
+            rm -rf "${stage}/unpack"
+
+            cp packaging/docker/Dockerfile packaging/docker/docker-entrypoint.sh config.yml "${stage}/"
+
+            # 2. 组装目标架构镜像。amd64 保持现有 classic builder 路径，arm64 用 buildx+qemu 产出真实镜像后再导出。
+            # 2. Assemble the target-arch image. Keep the existing classic builder path for amd64, and use buildx+qemu for arm64 before exporting.
+            cd "${stage}"
+            if [[ "${docker_platform}" == "linux/amd64" ]]; then
+              DOCKER_BUILDKIT=0 docker build --build-arg TARGETPLATFORM="${docker_platform}" -t "${image_tag}" .
+            else
+              docker buildx build \
+                --platform "${docker_platform}" \
+                --build-arg TARGETPLATFORM="${docker_platform}" \
+                --load \
+                -t "${image_tag}" \
+                .
+            fi
+            cd ..
+
+            # 3. 渲染 manifest.json，并把目标架构镜像导出到该架构的 ipkg 暂存目录。
+            # 3. Render manifest.json and export the target-arch image into that package staging dir.
+            bash "${render_manifest_script}" "${manifest_template}" "${package_stage}/manifest.json" "${ipkg_version}"
+            docker save "${image_tag}" | gzip > "${package_stage}/docker_image.tar.gz"
+
+            # 4. 打包 ipkg（文件名按架构固定，版本仅保留在 manifest.json）。
+            # 4. Pack ipkg (architecture-based filename; version stays in manifest.json).
+            tar -czf "release/${ipkg_name}" -C "${stage}/package" ikuai-bypass/
+            rm -rf "${stage}"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-ipkg
+          path: release/*.ipkg
+
+  build-openwrt-luci:
+    name: OpenWrt LuCI Package
+    needs:
+      - resolve-matrix
+    if: needs.resolve-matrix.outputs.has_cli == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build OpenWrt LuCI package
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-matrix.outputs.version }}
+          OPENWRT_PACKAGE_ARCH: all
+        run: |
+          set -euo pipefail
+          source .github/scripts/arch-helpers.sh
+
+          luci_base="$(ikb_luci_base)"
+          bash packaging/openwrt-luci/build-openwrt-luci-package.sh \
+            "${{ github.workspace }}" \
+            "./release" \
+            "${VERSION}" \
+            "${OPENWRT_PACKAGE_ARCH}" \
+            "${luci_base}"
+
+          ls -la release/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: openwrt-luci
+          path: release/*.ipk
+
+  docker:
+    name: Docker Multi-Arch
+    needs:
+      - resolve-matrix
+      - build-cli
+    if: needs.resolve-matrix.outputs.push_docker == 'true' && needs.resolve-matrix.outputs.docker_creds_available == 'true' && needs.resolve-matrix.outputs.docker_platforms != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cli-linux-*
+          path: release
+          merge-multiple: true
+
+      - name: Prepare Docker build context
+        env:
+          DOCKER_CLI_JSON: ${{ needs.resolve-matrix.outputs.docker_cli_matrix }}
+        run: bash packaging/docker/prepare-container-binaries.sh release .docker-release/multiarch
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: docker_meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.resolve-matrix.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.resolve-matrix.outputs.docker_latest == 'true' }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./.docker-release/multiarch
+          file: ./.docker-release/multiarch/Dockerfile
+          platforms: ${{ needs.resolve-matrix.outputs.docker_platforms }}
+          push: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-multiarch
+          cache-to: type=gha,mode=max,scope=docker-multiarch
+
+  publish:
+    name: Publish Release
+    needs:
+      - resolve-matrix
+      - build-cli
+      - build-cli-nightly
+      - build-lxc
+      - build-ipkg
+      - build-openwrt-luci
+      - build-gui
+      - build-gui-android
+      - build-gui-ios
+      - build-bsd
+    if: ${{ always() && needs.resolve-matrix.outputs.publish_release == 'true' && !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: release
+          pattern: "cli-*"
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: release
+          pattern: "gui-*"
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v8
+        if: needs.build-openwrt-luci.result == 'success'
+        with:
+          path: release
+          name: openwrt-luci
+
+      - name: Show release files
+        run: find release -maxdepth 2 -type f | sort
+
+      - name: Generate release notes from commit history
+        shell: bash
+        env:
+          TAG_NAME: ${{ needs.resolve-matrix.outputs.tag_name }}
+          CURRENT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          source .github/scripts/release-helpers.sh
+
+          # Ensure tags are available for history range detection.
+          git fetch --tags --force >/dev/null 2>&1 || true
+
+          current_ref="${TAG_NAME}"
+          current_sha="${CURRENT_SHA}"
+
+          # Why/为什么: base_tag 取“上一个正式版(非 pre-release)”。
+          # English: Pick the latest stable tag (non-prerelease) reachable from current_sha.
+          base_tag=""
+          base_tag="$(
+            git for-each-ref refs/tags --sort=-creatordate --format '%(refname:strip=2)' | awk 'NF' | while IFS= read -r t; do
+              [ -n "${t}" ] || continue
+              if [ "${t}" = "${current_ref}" ]; then
+                continue
+              fi
+
+              # Why/为什么: 只接受 release tag 前缀，避免误选 crate tag。
+              # English: Only accept repo release tag prefixes to avoid crate tags.
+              if ! printf '%s' "${t}" | grep -Eq '^(v|ikuai-bypass-v)'; then
+                continue
+              fi
+
+              if ! is_stable_release_tag "${t}"; then
+                continue
+              fi
+
+              if ! git merge-base --is-ancestor "${t}" "${current_sha}" 2>/dev/null; then
+                continue
+              fi
+
+              v="$(normalize_version_from_tag "${t}")"
+              pref=0
+              if printf '%s' "${t}" | grep -Eq '^ikuai-bypass-v'; then
+                pref=1
+              fi
+              printf '%s\t%d\t%s\n' "${v}" "${pref}" "${t}"
+            done | sort -t $'\t' -k1,1V -k2,2n | awk -F $'\t' 'END{print $3}'
+          )"
+
+          notes_file="/tmp/release-notes.md"
+          {
+            echo "## 变更"
+            echo
+            echo "> [ikuai-bypass v4.2.0](https://github.com/${REPO}/releases/tag/v4.2.0) 是支持爱快3.7.x的最后一个版本，最版只支持爱快v4.x"
+            echo
+            echo "> 爱快≥ 4.0.210的端口分流mode 不可以使用5，爱快≥ 4.0.210的主备模式是6 [详情](https://joyanhui.github.io/ikuai-bypass/ikuai-firmware-4.0.210-port-streaming-mode-fix.html)"
+            echo
+            echo "### 主要更新"
+            echo
+            echo "请参考日志： https://joyanhui.github.io/ikuai-bypass/updatelog/"
+            echo
+
+            commits=""
+            if [ -n "${base_tag}" ]; then
+              echo "范围: \`${base_tag}\` -> \`${current_ref}\`"
+              echo
+              # Why/为什么: 直接用 git 的 -n 限制条目数，避免在 pipefail 下触发 Broken pipe。
+              # English: Use git's -n to limit lines to avoid Broken pipe with pipefail.
+              commits="$(git log --reverse --no-merges -n 200 --pretty=format:'- %s ([`%h`](https://github.com/'"${REPO}"'/commit/%H))' "${base_tag}..${current_sha}" || true)"
+            else
+              echo "范围: 初始历史 -> \`${current_ref}\`"
+              echo
+              commits="$(git log --reverse --no-merges -n 200 --pretty=format:'- %s ([`%h`](https://github.com/'"${REPO}"'/commit/%H))' "${current_sha}" || true)"
+            fi
+
+            if [ -z "${commits}" ]; then
+              echo "- (无提交)"
+            else
+              printf '%s\n' "${commits}"
+            fi
+
+            echo
+            echo "## Full Changelog"
+            if [ -n "${base_tag}" ]; then
+              echo "https://github.com/${REPO}/compare/${base_tag}...${current_ref}"
+            else
+              echo "https://github.com/${REPO}/commits/${current_sha}"
+            fi
+          } > "${notes_file}"
+
+          echo "Generated release notes preview:"
+          sed -n '1,120p' "${notes_file}"
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.resolve-matrix.outputs.tag_name }}
+          IS_PRERELEASE: ${{ needs.resolve-matrix.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+
+          # Why/为什么: softprops/action-gh-release 总是携带 target_commitish，
+          # 当发布期间默认分支前进了新 commit 时，GITHUB_TOKEN 会被平台以 403
+          # "Resource not accessible by integration" 拒绝（action issue #411/#758）。
+          # 改用 gh release create：tag 已存在时只关联 tag、不传 target_commitish，
+          # 从根上规避该限制；tag 不存在时 gh 自动以默认分支 tip 创建。
+          # English: softprops/action-gh-release always sends target_commitish, which
+          # GitHub rejects with 403 for GITHUB_TOKEN when it points at a non-tip commit.
+          # gh release create associates the existing tag without target_commitish.
+
+          if gh release view "${TAG_NAME}" --repo "${REPO}" >/dev/null 2>&1; then
+            echo "Release ${TAG_NAME} already exists, skip creation"
+            exit 0
+          fi
+
+          args=(release create "${TAG_NAME}" --repo "${REPO}" --title "${TAG_NAME}" --notes-file /tmp/release-notes.md)
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+
+          # Why/为什么: 只上传 release/ 第一层归档文件；.stage/ 目录是打包中间产物，
+          # 内含同名 ikuai-bypass/README.md/config.yml，上传会触发 asset 重名 422。
+          # English: Only top-level archives are uploaded; .stage/ dirs are packaging
+          # intermediates with duplicate basenames that cause 422 on asset upload.
+          while IFS= read -r -d '' f; do
+            args+=("${f}")
+          done < <(find release -maxdepth 1 -type f -print0 | sort -z)
+
+          gh "${args[@]}"

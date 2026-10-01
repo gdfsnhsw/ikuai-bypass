@@ -1,0 +1,232 @@
+{
+  // CLI targets / CLI 发布目标
+  "cli": [
+    {
+      "label": "linux-amd64",
+      "runner": "ubuntu-latest",
+      "target": "x86_64-unknown-linux-musl",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "linux/amd64",
+      "mode": ["minimal", "full"]
+    },
+    {
+      "label": "linux-386",
+      "runner": "ubuntu-latest",
+      "target": "i686-unknown-linux-musl",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "linux/386",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-arm5",
+      "runner": "ubuntu-latest",
+      "target": "armv5te-unknown-linux-musleabi",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-arm6",
+      "runner": "ubuntu-latest",
+      "target": "arm-unknown-linux-musleabi",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-arm7",
+      "runner": "ubuntu-latest",
+      "target": "armv7-unknown-linux-musleabihf",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "linux/arm/v7",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-arm64",
+      "runner": "ubuntu-latest",
+      "target": "aarch64-unknown-linux-musl",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "linux/arm64",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-ppc64le",
+      "runner": "ubuntu-latest",
+      "target": "powerpc64le-unknown-linux-gnu",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "linux/ppc64le",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-riscv64",
+      "runner": "ubuntu-latest",
+      "target": "riscv64gc-unknown-linux-musl",
+      "builder": "cross",
+      "archive": "zip",
+      "docker_platform": "linux/riscv64",
+      "mode": ["full"]
+    },
+    {
+      "label": "windows-amd64",
+      "runner": "windows-latest",
+      "target": "x86_64-pc-windows-msvc",
+      "builder": "cargo",
+      "archive": "zip",
+      "docker_platform": "",
+      "mode": ["minimal", "full"]
+    },
+    {
+      "label": "macos-amd64",
+      "runner": "macos-15",
+      "target": "x86_64-apple-darwin",
+      "builder": "cargo",
+      "archive": "zip",
+      "docker_platform": "",
+      "mode": ["full"]
+    },
+    {
+      "label": "macos-arm64",
+      "runner": "macos-15",
+      "target": "aarch64-apple-darwin",
+      "builder": "cargo",
+      "archive": "zip",
+      "docker_platform": "",
+      "mode": ["full"]
+    }
+  ],
+
+  // BSD targets / BSD 发布目标
+  "bsd": [
+    {
+      "label": "freebsd-amd64",
+      "runner": "ubuntu-latest",
+      "vm_os": "freebsd",
+      "target": "x86_64-unknown-freebsd",
+      "archive": "zip",
+      "mode": ["full"]
+    },
+    {
+      "label": "freebsd-386",
+      "runner": "ubuntu-latest",
+      "vm_os": "freebsd",
+      "target": "i686-unknown-freebsd",
+      "archive": "zip",
+      "mode": ["full"]
+    }
+  ],
+
+  // Nightly-only targets / 仅 nightly 的实验目标
+  "cli_nightly": [
+    {
+      "label": "linux-mipsel",
+      "runner": "ubuntu-latest",
+      "target": "mipsel-unknown-linux-musl",
+      "archive": "zip",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-mips64",
+      "runner": "ubuntu-latest",
+      "target": "mips64-unknown-linux-gnuabi64",
+      "archive": "zip",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-mips64el",
+      "runner": "ubuntu-latest",
+      "target": "mips64el-unknown-linux-gnuabi64",
+      "archive": "zip",
+      "mode": ["full"]
+    },
+    {
+      "label": "linux-mips",
+      "runner": "ubuntu-latest",
+      "target": "mips-unknown-linux-gnu",
+      "archive": "zip",
+      "mode": ["full"]
+    }
+  ],
+
+  // GUI targets / GUI 发布目标
+  "gui": [
+    {
+      "label": "linux-x86_64",
+      "runner": "ubuntu-22.04",
+      "target": "x86_64-unknown-linux-gnu",
+      "bundle_args": "",
+      "bundle_active": false,
+      "collect_pattern": "target/release/ikb-app",
+      "mode": ["minimal", "full"]
+    },
+    {
+      "label": "windows-x86_64",
+      "runner": "windows-latest",
+      "target": "x86_64-pc-windows-msvc",
+      "bundle_args": "",
+      "bundle_active": false,
+      "collect_pattern": "target/release/*.exe",
+      "mode": ["full"]
+    },
+    {
+      "label": "macos-aarch64",
+      "runner": "macos-15",
+      "target": "aarch64-apple-darwin",
+      "bundle_args": "--bundles dmg",
+      "bundle_active": true,
+      "collect_pattern": "target/release/bundle/**/*.dmg",
+      "mode": ["full"]
+    },
+    {
+      "label": "macos-x86_64",
+      "runner": "macos-15",
+      "target": "x86_64-apple-darwin",
+      "bundle_args": "--bundles dmg",
+      "bundle_active": true,
+      "collect_pattern": "target/release/bundle/**/*.dmg",
+      "mode": ["full"]
+    }
+  ],
+
+  // Android GUI targets / Android GUI 发布目标
+  "gui_android": [
+    {
+      "label": "android-aarch64",
+      "runner": "ubuntu-latest",
+      "target": "aarch64-linux-android",
+      "tauri_target": "aarch64",
+      "mode": ["full"]
+    },
+    {
+      "label": "android-armv7",
+      "runner": "ubuntu-latest",
+      "target": "armv7-linux-androideabi",
+      "tauri_target": "armv7",
+      "mode": ["full"]
+    },
+    {
+      "label": "android-x86_64",
+      "runner": "ubuntu-latest",
+      "target": "x86_64-linux-android",
+      "tauri_target": "x86_64",
+      "mode": ["full"]
+    }
+  ],
+
+  // iOS GUI targets / iOS GUI 发布目标
+  "gui_ios": [
+    {
+      "label": "ios-aarch64",
+      "runner": "macos-15",
+      "target": "aarch64-apple-ios",
+      "tauri_target": "aarch64",
+      "mode": ["full"]
+    }
+  ]
+}
